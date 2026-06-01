@@ -102,6 +102,7 @@ type AutoscalingRunnerSetSpec struct {
 	// +optional
 	ListenerConfigSecretMetadata *ResourceMeta `json:"listenerConfigSecretMetadata,omitempty"`
 
+	// +optional
 	EphemeralRunnerSetMetadata *ResourceMeta `json:"ephemeralRunnerSetMetadata,omitempty"`
 
 	// +optional
