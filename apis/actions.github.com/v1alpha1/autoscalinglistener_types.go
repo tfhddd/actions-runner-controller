@@ -81,7 +81,6 @@ type AutoscalingListenerSpec struct {
 
 	// +optional
 	RoleBindingMetadata *ResourceMeta `json:"roleBindingMetadata,omitempty"`
-
 }
 
 // AutoscalingListenerStatus defines the observed state of AutoscalingListener
