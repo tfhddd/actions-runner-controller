@@ -7,9 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"github.com/actions/actions-runner-controller/cmd/ghalistener/client"
 	"github.com/actions/actions-runner-controller/cmd/ghalistener/config"
 	"github.com/actions/actions-runner-controller/cmd/ghalistener/metrics"
 	"github.com/actions/actions-runner-controller/cmd/ghalistener/scaler"
@@ -92,21 +90,6 @@ func run(ctx context.Context, config *config.Config) error {
 		}
 	}()
 
-	// Fallback cluster mode: delay AcquireJobs so the primary cluster wins the race.
-	// Set ACQUIRE_JOBS_DELAY (e.g. "15s") on the fallback cluster only.
-	// Leave unset on the primary cluster — it acquires jobs immediately.
-	var listenerClient listener.Client = sessionClient
-	if delayStr := os.Getenv("ACQUIRE_JOBS_DELAY"); delayStr != "" {
-		delay, err := time.ParseDuration(delayStr)
-		if err != nil {
-			return fmt.Errorf("invalid ACQUIRE_JOBS_DELAY %q: %w", delayStr, err)
-		}
-		if delay > 0 {
-			logger.Info("Fallback mode enabled: AcquireJobs will be delayed", "delay", delay)
-			listenerClient = client.NewDelayedAcquireClient(sessionClient, delay)
-		}
-	}
-
 	var listenerOptions []listener.Option
 	if metricsExporter != nil {
 		listenerOptions = append(
@@ -119,7 +102,7 @@ func run(ctx context.Context, config *config.Config) error {
 	}
 
 	listener, err := listener.New(
-		listenerClient,
+		sessionClient,
 		listener.Config{
 			ScaleSetID: config.RunnerScaleSetID,
 			MaxRunners: config.MaxRunners,
