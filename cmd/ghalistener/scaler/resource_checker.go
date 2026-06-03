@@ -110,6 +110,23 @@ func jobResourceRequirements(annotations map[string]string) (corev1.ResourceList
 	return reqs, nil
 }
 
+// inferFromRunnerContainerLimits extracts resource limits from the "runner" container
+// in the pod spec as a fallback when no job resource annotations are present.
+// This covers dind and kubernetes modes where the runner pod spec itself is the
+// authoritative source of per-job resource requirements.
+func inferFromRunnerContainerLimits(containers []corev1.Container) corev1.ResourceList {
+	for _, c := range containers {
+		if c.Name != v1alpha1.EphemeralRunnerContainerName {
+			continue
+		}
+		if len(c.Resources.Limits) > 0 {
+			return c.Resources.Limits.DeepCopy()
+		}
+		return nil
+	}
+	return nil
+}
+
 // parseNPUAnnotation parses "<resource-name>:<count>" (e.g. "huawei.com/ascend-1980:4").
 func parseNPUAnnotation(v string) (string, int, error) {
 	idx := strings.LastIndex(v, ":")
@@ -148,7 +165,10 @@ func (c *KubernetesResourceChecker) AdjustCount(ctx context.Context) (int, error
 		return 0, fmt.Errorf("parse job resource annotations: %w", err)
 	}
 	if len(jobRequests) == 0 {
-		c.logger.Info("No job resource annotations defined on EphemeralRunnerSet, skipping resource check")
+		jobRequests = inferFromRunnerContainerLimits(ers.Spec.EphemeralRunnerSpec.Spec.Containers)
+	}
+	if len(jobRequests) == 0 {
+		c.logger.Info("No resource constraints found on EphemeralRunnerSet, skipping resource check")
 		return math.MaxInt, nil
 	}
 
@@ -223,6 +243,75 @@ func (c *KubernetesResourceChecker) AdjustCount(ctx context.Context) (int, error
 	}
 
 	c.logger.Info("Capacity calculated", "capacity", capacity)
+
+	// Apply namespace ResourceQuota constraint if one exists for the job resources.
+	quotaCapacity, err := c.namespaceQuotaCapacity(ctx, jobRequests, currentRunnerCount)
+	if err != nil {
+		c.logger.Warn("Namespace quota check failed, skipping quota constraint", "error", err)
+	} else if quotaCapacity < capacity {
+		c.logger.Info("Namespace quota limits capacity", "quotaCapacity", quotaCapacity, "nodeCapacity", capacity)
+		capacity = quotaCapacity
+	}
+
+	c.logger.Info("Final capacity after quota check", "capacity", capacity)
+	return capacity, nil
+}
+
+// namespaceQuotaCapacity reads ResourceQuota objects in the runner namespace and returns
+// the capacity constrained by namespace-level quotas. If no quota covers a job resource,
+// that resource is unconstrained at the namespace level (returns math.MaxInt).
+//
+// ResourceQuota.status.used is maintained automatically by Kubernetes, so we read the
+// remaining quota directly without needing to aggregate pod requests ourselves.
+func (c *KubernetesResourceChecker) namespaceQuotaCapacity(
+	ctx context.Context,
+	jobRequests corev1.ResourceList,
+	currentRunnerCount int,
+) (int, error) {
+	quotaList, err := c.clientset.CoreV1().ResourceQuotas(c.ephemeralRunnerSetNS).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if kerrors.IsForbidden(err) {
+			c.logger.Warn("Insufficient RBAC permissions to list resourcequotas, skipping namespace quota check")
+			return math.MaxInt, nil
+		}
+		return 0, fmt.Errorf("list resourcequotas in namespace %s: %w", c.ephemeralRunnerSetNS, err)
+	}
+	if len(quotaList.Items) == 0 {
+		c.logger.Info("No ResourceQuota found in namespace, skipping namespace quota check", "namespace", c.ephemeralRunnerSetNS)
+		return math.MaxInt, nil
+	}
+
+	capacity := math.MaxInt
+	for resName, req := range jobRequests {
+		// ResourceQuota tracks extended resources (e.g. huawei.com/ascend-1980) under
+		// the key "requests.<resource-name>".
+		quotaKey := corev1.ResourceName("requests." + string(resName))
+
+		for _, quota := range quotaList.Items {
+			hard, hasHard := quota.Status.Hard[quotaKey]
+			if !hasHard {
+				continue
+			}
+			used, hasUsed := quota.Status.Used[quotaKey]
+			if !hasUsed {
+				used = resource.MustParse("0")
+			}
+			remaining := hard.DeepCopy()
+			remaining.Sub(used)
+			c.logger.Info("Namespace quota check",
+				"quota", quota.Name,
+				"resource", quotaKey,
+				"hard", hard.String(),
+				"used", used.String(),
+				"remaining", remaining.String(),
+			)
+			feasibleAdditional := divideQuantity(remaining, req)
+			totalFeasible := currentRunnerCount + feasibleAdditional
+			if totalFeasible < capacity {
+				capacity = totalFeasible
+			}
+		}
+	}
 	return capacity, nil
 }
 

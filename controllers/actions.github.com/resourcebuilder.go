@@ -806,6 +806,11 @@ func rulesForListenerRole(resourceNames []string) []rbacv1.PolicyRule {
 			Resources: []string{"ephemeralrunners", "ephemeralrunners/status"},
 			Verbs:     []string{"patch"},
 		},
+		{
+			APIGroups: []string{""},
+			Resources: []string{"resourcequotas"},
+			Verbs:     []string{"list"},
+		},
 	}
 }
 
