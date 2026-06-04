@@ -64,6 +64,12 @@ rules:
   - list
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - resourcequotas
+  verbs:
+  - list
+- apiGroups:
   - actions.github.com
   resources:
   - autoscalinglisteners
