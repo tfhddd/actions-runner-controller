@@ -140,5 +140,10 @@ rules:
   verbs:
   - list
   - watch
-  - patch
+- apiGroups:
+  - ""
+  resources:
+  - resourcequotas
+  verbs:
+  - list
 {{- end }}
