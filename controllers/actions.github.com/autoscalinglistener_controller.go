@@ -776,11 +776,9 @@ func (r *AutoscalingListenerReconciler) reconcileClusterRBAC(ctx context.Context
 	existingRuleHash := clusterRole.Labels["cluster-role-policy-rules-hash"]
 	desiredRules := rulesForListenerClusterRole()
 	desiredRulesHash := hash.ComputeTemplateHash(&desiredRules)
-	if existingRuleHash != desiredRulesHash {
-		log.Info("Updating the listener cluster role with up-to-date rules")
+	if existingRuleHash != "" && existingRuleHash != desiredRulesHash {
 		result, err := r.updateClusterRoleForListener(ctx, clusterRole, desiredRules, desiredRulesHash, log)
 		if kerrors.IsForbidden(err) {
-			log.Info("Insufficient permissions to update ClusterRole, skipping — resource checking may be unavailable", "name", clusterRole.Name)
 			return false, ctrl.Result{}, nil
 		}
 		return true, result, err
@@ -814,7 +812,9 @@ func (r *AutoscalingListenerReconciler) updateClusterRoleForListener(ctx context
 
 	logger.Info("Updating listener cluster role", "name", updatedClusterRole.Name, "oldRules", clusterRole.Rules, "newRules", updatedClusterRole.Rules)
 	if err := r.Update(ctx, updatedClusterRole); err != nil {
-		logger.Error(err, "Unable to update listener cluster role", "name", updatedClusterRole.Name)
+		if !kerrors.IsForbidden(err) {
+			logger.Error(err, "Unable to update listener cluster role", "name", updatedClusterRole.Name)
+		}
 		return ctrl.Result{}, err
 	}
 
