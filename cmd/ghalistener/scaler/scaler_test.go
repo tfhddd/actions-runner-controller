@@ -1,11 +1,14 @@
 package scaler
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var discardLogger = slog.New(slog.DiscardHandler)
@@ -331,4 +334,68 @@ func TestSetDesiredWorkerState_MinMaxSet(t *testing.T) {
 		assert.Equal(t, 1, w.targetRunners)
 		assert.Equal(t, 2, w.patchSeq)
 	})
+}
+
+// mockResourceChecker implements ResourceChecker for testing.
+type mockResourceChecker struct {
+	adjusted int
+	err      error
+}
+
+func (m *mockResourceChecker) AdjustCount(_ context.Context) (int, error) {
+	if m.err != nil {
+		return 0, m.err
+	}
+	return m.adjusted, nil
+}
+
+func TestHandleDesiredRunnerCount_CheckerReturnsFalse(t *testing.T) {
+	w := &Scaler{
+		config:          Config{MinRunners: 0, MaxRunners: 10},
+		targetRunners:   -1,
+		patchSeq:        -1,
+		logger:          discardLogger,
+		resourceChecker: &mockResourceChecker{adjusted: 0},
+	}
+	result, err := w.HandleDesiredRunnerCount(context.Background(), 5)
+	require.NoError(t, err)
+	assert.Equal(t, 0, result)
+}
+
+func TestHandleDesiredRunnerCount_CheckerReturnsError(t *testing.T) {
+	// fail-open: when checker returns an error, scaling must NOT be blocked.
+	// The k8s patch will panic (nil clientset, no real server), but the important
+	// assertion is that we did NOT return (0, nil) early — which would mean fail-closed.
+	// A panic here proves execution proceeded past the resource check.
+	w := &Scaler{
+		config:        Config{MinRunners: 0, MaxRunners: 10},
+		targetRunners: -1,
+		patchSeq:      -1,
+		logger:        discardLogger,
+		resourceChecker: &mockResourceChecker{
+			err: errors.New("api error"),
+		},
+	}
+	// fail-open: checker error must not cause a (0, nil) early return.
+	// Execution proceeds to the k8s patch which panics on nil clientset —
+	// that panic is proof the early-return was NOT taken.
+	assert.Panics(t, func() {
+		w.HandleDesiredRunnerCount(context.Background(), 5) //nolint:errcheck
+	}, "checker error should not block scale-up (fail-open): execution must reach k8s patch")
+}
+
+func TestHandleDesiredRunnerCount_NilChecker(t *testing.T) {
+	// nil checker: resource check is skipped entirely, scaling proceeds normally.
+	// The k8s patch panics on nil clientset — that panic proves execution
+	// reached the patch (i.e., the nil-checker guard did not block scaling).
+	w := &Scaler{
+		config:          Config{MinRunners: 0, MaxRunners: 10},
+		targetRunners:   -1,
+		patchSeq:        -1,
+		logger:          discardLogger,
+		resourceChecker: nil,
+	}
+	assert.Panics(t, func() {
+		w.HandleDesiredRunnerCount(context.Background(), 3) //nolint:errcheck
+	}, "nil checker should not block scale-up")
 }

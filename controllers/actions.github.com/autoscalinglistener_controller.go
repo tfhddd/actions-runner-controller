@@ -68,6 +68,8 @@ type AutoscalingListenerReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;delete;get;list;watch;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;delete;get;list;watch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=create;delete;get
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=create;delete;get
 // +kubebuilder:rbac:groups=actions.github.com,resources=autoscalinglisteners,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=actions.github.com,resources=autoscalinglisteners/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=actions.github.com,resources=autoscalinglisteners/finalizers,verbs=update
@@ -193,6 +195,10 @@ func (r *AutoscalingListenerReconciler) Reconcile(ctx context.Context, req ctrl.
 		// Create a role binding for the listener pod in the AutoScalingRunnerSet namespace
 		log.Info("Creating a role binding for the service account and role")
 		return r.createRoleBindingForListener(ctx, autoscalingListener, listenerRole, serviceAccount, log)
+	}
+
+	if done, result, err := r.reconcileClusterRBAC(ctx, autoscalingListener, serviceAccount, log); done {
+		return result, err
 	}
 
 	// Create a secret containing proxy config if specified
@@ -406,6 +412,24 @@ func (r *AutoscalingListenerReconciler) cleanupResources(ctx context.Context, au
 		return false, fmt.Errorf("failed to get listener role: %w", err)
 	}
 	logger.Info("Listener role is deleted")
+
+	listenerClusterRoleBinding := new(rbacv1.ClusterRoleBinding)
+	err = r.Get(ctx, types.NamespacedName{Name: autoscalingListener.Name}, listenerClusterRoleBinding)
+	switch {
+	case err == nil:
+		if listenerClusterRoleBinding.DeletionTimestamp.IsZero() {
+			logger.Info("Deleting the listener cluster role binding")
+			if err := r.Delete(ctx, listenerClusterRoleBinding); err != nil && !kerrors.IsForbidden(err) {
+				return false, fmt.Errorf("failed to delete listener cluster role binding: %w", err)
+			}
+		}
+		requeue = true
+	case kerrors.IsNotFound(err) || kerrors.IsForbidden(err):
+		// not found or no permission — nothing to clean up
+	default:
+		return false, fmt.Errorf("failed to get listener cluster role binding: %w", err)
+	}
+	logger.Info("Listener cluster role binding is deleted")
 
 	logger.Info("Cleaning up the listener service account")
 	listenerSa := new(corev1.ServiceAccount)
@@ -724,6 +748,89 @@ func (r *AutoscalingListenerReconciler) createRoleBindingForListener(ctx context
 		"role", listenerRole.Name,
 		"serviceAccountNamespace", serviceAccount.Namespace,
 		"serviceAccount", serviceAccount.Name)
+	return ctrl.Result{Requeue: true}, nil
+}
+
+
+// reconcileClusterRBAC ensures the ClusterRole and ClusterRoleBinding for the listener exist.
+// If the controller lacks permission to manage ClusterRoles/ClusterRoleBindings, it logs a warning
+// and continues — the listener pod will still be created, but resource checking will be skipped.
+// Returns (true, result, err) when the caller should return immediately, (false, _, nil) to continue.
+func (r *AutoscalingListenerReconciler) reconcileClusterRBAC(ctx context.Context, autoscalingListener *v1alpha1.AutoscalingListener, serviceAccount *corev1.ServiceAccount, log logr.Logger) (done bool, result ctrl.Result, err error) {
+	clusterRole := new(rbacv1.ClusterRole)
+	if err := r.Get(ctx, types.NamespacedName{Name: autoscalingListener.Name}, clusterRole); err != nil {
+		if !kerrors.IsNotFound(err) {
+			if kerrors.IsForbidden(err) {
+				log.Info("Insufficient permissions to manage ClusterRoles, skipping cluster RBAC setup — resource checking will be unavailable")
+				return false, ctrl.Result{}, nil
+			}
+			log.Error(err, "Unable to get listener cluster role", "name", autoscalingListener.Name)
+			return true, ctrl.Result{}, err
+		}
+		log.Info("Creating a cluster role for the listener pod")
+		result, err := r.createClusterRoleForListener(ctx, autoscalingListener, log)
+		return true, result, err
+	}
+
+	clusterRoleBinding := new(rbacv1.ClusterRoleBinding)
+	if err := r.Get(ctx, types.NamespacedName{Name: autoscalingListener.Name}, clusterRoleBinding); err != nil {
+		if !kerrors.IsNotFound(err) {
+			if kerrors.IsForbidden(err) {
+				log.Info("Insufficient permissions to manage ClusterRoleBindings, skipping cluster RBAC setup — resource checking will be unavailable")
+				return false, ctrl.Result{}, nil
+			}
+			log.Error(err, "Unable to get listener cluster role binding", "name", autoscalingListener.Name)
+			return true, ctrl.Result{}, err
+		}
+		log.Info("Creating a cluster role binding for the listener pod")
+		result, err := r.createClusterRoleBindingForListener(ctx, autoscalingListener, serviceAccount, log)
+		return true, result, err
+	}
+
+	return false, ctrl.Result{}, nil
+}
+
+
+func (r *AutoscalingListenerReconciler) createClusterRoleForListener(ctx context.Context, autoscalingListener *v1alpha1.AutoscalingListener, logger logr.Logger) (ctrl.Result, error) {
+	newClusterRole := r.newScaleSetListenerClusterRole(autoscalingListener)
+
+	logger.Info("Creating listener cluster role", "name", newClusterRole.Name)
+	if err := r.Create(ctx, newClusterRole); err != nil {
+		if kerrors.IsAlreadyExists(err) {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		if kerrors.IsForbidden(err) {
+			logger.Info("Insufficient permissions to create ClusterRole, skipping — resource checking will be unavailable")
+			return ctrl.Result{}, nil
+		}
+		logger.Error(err, "Unable to create listener cluster role", "name", newClusterRole.Name)
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Created listener cluster role", "name", newClusterRole.Name)
+	return ctrl.Result{Requeue: true}, nil
+}
+
+func (r *AutoscalingListenerReconciler) createClusterRoleBindingForListener(ctx context.Context, autoscalingListener *v1alpha1.AutoscalingListener, serviceAccount *corev1.ServiceAccount, logger logr.Logger) (ctrl.Result, error) {
+	newClusterRoleBinding := r.newScaleSetListenerClusterRoleBinding(autoscalingListener, serviceAccount)
+
+	logger.Info("Creating listener cluster role binding",
+		"name", newClusterRoleBinding.Name,
+		"serviceAccountNamespace", serviceAccount.Namespace,
+		"serviceAccount", serviceAccount.Name)
+	if err := r.Create(ctx, newClusterRoleBinding); err != nil {
+		if kerrors.IsAlreadyExists(err) {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		if kerrors.IsForbidden(err) {
+			logger.Info("Insufficient permissions to create ClusterRoleBinding, skipping — resource checking will be unavailable")
+			return ctrl.Result{}, nil
+		}
+		logger.Error(err, "Unable to create listener cluster role binding", "name", newClusterRoleBinding.Name)
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Created listener cluster role binding", "name", newClusterRoleBinding.Name)
 	return ctrl.Result{Requeue: true}, nil
 }
 
