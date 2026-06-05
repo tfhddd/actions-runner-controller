@@ -68,7 +68,7 @@ type AutoscalingListenerReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;delete;get;list;watch;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;delete;get;list;watch
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=create;delete;get
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=create;delete;get;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=create;delete;get
 // +kubebuilder:rbac:groups=actions.github.com,resources=autoscalinglisteners,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=actions.github.com,resources=autoscalinglisteners/status,verbs=get;update;patch
@@ -772,6 +772,16 @@ func (r *AutoscalingListenerReconciler) reconcileClusterRBAC(ctx context.Context
 		return true, result, err
 	}
 
+	// Make sure the cluster role has up-to-date rules (same hash-based pattern as the namespace Role).
+	existingRuleHash := clusterRole.Labels["cluster-role-policy-rules-hash"]
+	desiredRules := rulesForListenerClusterRole()
+	desiredRulesHash := hash.ComputeTemplateHash(&desiredRules)
+	if existingRuleHash != desiredRulesHash {
+		log.Info("Updating the listener cluster role with up-to-date rules")
+		result, err := r.updateClusterRoleForListener(ctx, clusterRole, desiredRules, desiredRulesHash, log)
+		return true, result, err
+	}
+
 	clusterRoleBinding := new(rbacv1.ClusterRoleBinding)
 	if err := r.Get(ctx, types.NamespacedName{Name: autoscalingListener.Name}, clusterRoleBinding); err != nil {
 		if !kerrors.IsNotFound(err) {
@@ -788,6 +798,24 @@ func (r *AutoscalingListenerReconciler) reconcileClusterRBAC(ctx context.Context
 	}
 
 	return false, ctrl.Result{}, nil
+}
+
+func (r *AutoscalingListenerReconciler) updateClusterRoleForListener(ctx context.Context, clusterRole *rbacv1.ClusterRole, desiredRules []rbacv1.PolicyRule, desiredRulesHash string, logger logr.Logger) (ctrl.Result, error) {
+	updatedClusterRole := clusterRole.DeepCopy()
+	if updatedClusterRole.Labels == nil {
+		updatedClusterRole.Labels = make(map[string]string)
+	}
+	updatedClusterRole.Labels["cluster-role-policy-rules-hash"] = desiredRulesHash
+	updatedClusterRole.Rules = desiredRules
+
+	logger.Info("Updating listener cluster role", "name", updatedClusterRole.Name, "oldRules", clusterRole.Rules, "newRules", updatedClusterRole.Rules)
+	if err := r.Update(ctx, updatedClusterRole); err != nil {
+		logger.Error(err, "Unable to update listener cluster role", "name", updatedClusterRole.Name)
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Updated listener cluster role", "name", updatedClusterRole.Name)
+	return ctrl.Result{Requeue: true}, nil
 }
 
 

@@ -814,7 +814,7 @@ func rulesForListenerClusterRole() []rbacv1.PolicyRule {
 		{
 			APIGroups: []string{""},
 			Resources: []string{"nodes"},
-			Verbs:     []string{"list"},
+			Verbs:     []string{"get", "list"},
 		},
 		{
 			APIGroups: []string{""},

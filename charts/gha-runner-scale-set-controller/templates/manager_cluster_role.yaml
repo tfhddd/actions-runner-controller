@@ -122,6 +122,13 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - nodes
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - ""
+  resources:
   - serviceaccounts
   verbs:
   - list
@@ -141,6 +148,23 @@ rules:
   - list
   - watch
   - patch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterroles
+  verbs:
+  - create
+  - delete
+  - get
+  - update
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterrolebindings
+  verbs:
+  - create
+  - delete
+  - get
 - apiGroups:
   - scheduling.volcano.sh
   resources:
