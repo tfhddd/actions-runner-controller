@@ -187,3 +187,9 @@ rules:
   - list
   - update
   - watch
+- apiGroups:
+  - scheduling.volcano.sh
+  resources:
+  - queues
+  verbs:
+  - get

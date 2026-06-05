@@ -141,4 +141,10 @@ rules:
   - list
   - watch
   - patch
+- apiGroups:
+  - scheduling.volcano.sh
+  resources:
+  - queues
+  verbs:
+  - get
 {{- end }}

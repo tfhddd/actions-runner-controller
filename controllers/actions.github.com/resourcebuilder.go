@@ -821,6 +821,11 @@ func rulesForListenerClusterRole() []rbacv1.PolicyRule {
 			Resources: []string{"pods"},
 			Verbs:     []string{"list"},
 		},
+		{
+			APIGroups: []string{"scheduling.volcano.sh"},
+			Resources: []string{"queues"},
+			Verbs:     []string{"get"},
+		},
 	}
 }
 
