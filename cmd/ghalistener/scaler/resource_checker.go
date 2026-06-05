@@ -18,6 +18,8 @@ import (
 
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
 	arcconst "github.com/actions/actions-runner-controller/controllers/actions.github.com"
+	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	volcanoclient "volcano.sh/apis/pkg/client/clientset/versioned"
 )
 
 // ResourceChecker decides whether the cluster has enough resources to run count runners.
@@ -33,6 +35,7 @@ type ersGetter func(ctx context.Context, ns, name string) (*v1alpha1.EphemeralRu
 // KubernetesResourceChecker implements ResourceChecker against a live cluster.
 type KubernetesResourceChecker struct {
 	clientset              kubernetes.Interface
+	volcanoClient          volcanoclient.Interface
 	restClient             rest.Interface
 	ephemeralRunnerSetNS   string
 	ephemeralRunnerSetName string
@@ -42,13 +45,21 @@ type KubernetesResourceChecker struct {
 }
 
 // NewKubernetesResourceChecker constructs a checker wired to the live k8s API.
+// cfg is the rest config already obtained by the caller; it is reused to build
+// the Volcano client without a redundant InClusterConfig call.
 func NewKubernetesResourceChecker(
 	cs *kubernetes.Clientset,
+	cfg *rest.Config,
 	ns, name string,
 	logger *slog.Logger,
 ) *KubernetesResourceChecker {
+	var vc volcanoclient.Interface
+	if cfg != nil {
+		vc, _ = volcanoclient.NewForConfig(cfg)
+	}
 	c := &KubernetesResourceChecker{
 		clientset:              cs,
+		volcanoClient:          vc,
 		restClient:             cs.RESTClient(),
 		ephemeralRunnerSetNS:   ns,
 		ephemeralRunnerSetName: name,
@@ -244,72 +255,82 @@ func (c *KubernetesResourceChecker) AdjustCount(ctx context.Context) (int, error
 
 	c.logger.Info("Capacity calculated", "capacity", capacity)
 
-	// Apply namespace ResourceQuota constraint if one exists for the job resources.
-	quotaCapacity, err := c.namespaceQuotaCapacity(ctx, jobRequests, currentRunnerCount)
+	// Apply Volcano Queue constraint if the runner pod template carries a queue annotation.
+	queueCapacity, err := c.volcanoQueueCapacity(ctx, ers, jobRequests, currentRunnerCount)
 	if err != nil {
-		c.logger.Warn("Namespace quota check failed, skipping quota constraint", "error", err)
-	} else if quotaCapacity < capacity {
-		c.logger.Info("Namespace quota limits capacity", "quotaCapacity", quotaCapacity, "nodeCapacity", capacity)
-		capacity = quotaCapacity
+		c.logger.Warn("Volcano queue check failed, skipping queue constraint", "error", err)
+	} else if queueCapacity < capacity {
+		c.logger.Info("Volcano queue limits capacity", "queueCapacity", queueCapacity, "nodeCapacity", capacity)
+		capacity = queueCapacity
 	}
 
-	c.logger.Info("Final capacity after quota check", "capacity", capacity)
+	c.logger.Info("Final capacity after queue check", "capacity", capacity)
 	return capacity, nil
 }
 
-// namespaceQuotaCapacity reads ResourceQuota objects in the runner namespace and returns
-// the capacity constrained by namespace-level quotas. If no quota covers a job resource,
-// that resource is unconstrained at the namespace level (returns math.MaxInt).
+// volcanoQueueCapacity reads the Volcano Queue referenced by the runner pod
+// template annotation "scheduling.volcano.sh/queue-name" and returns the
+// capacity constrained by the queue's capability.
 //
-// ResourceQuota.status.used is maintained automatically by Kubernetes, so we read the
-// remaining quota directly without needing to aggregate pod requests ourselves.
-func (c *KubernetesResourceChecker) namespaceQuotaCapacity(
+// The remaining headroom is queue.spec.capability - queue.status.allocated,
+// where status.allocated is maintained by the Volcano scheduler and covers
+// all pods bound to nodes across every namespace that share the same queue.
+//
+// If Volcano is not installed or the ERS carries no queue annotation the
+// check is skipped (returns math.MaxInt).
+func (c *KubernetesResourceChecker) volcanoQueueCapacity(
 	ctx context.Context,
+	ers *v1alpha1.EphemeralRunnerSet,
 	jobRequests corev1.ResourceList,
 	currentRunnerCount int,
 ) (int, error) {
-	quotaList, err := c.clientset.CoreV1().ResourceQuotas(c.ephemeralRunnerSetNS).List(ctx, metav1.ListOptions{})
+	if c.volcanoClient == nil {
+		return math.MaxInt, nil
+	}
+
+	queueName, ok := ers.Spec.EphemeralRunnerSpec.ObjectMeta.Annotations[schedulingv1beta1.QueueNameAnnotationKey]
+	if !ok || queueName == "" {
+		c.logger.Info("No Volcano queue annotation on runner pod template, skipping queue check")
+		return math.MaxInt, nil
+	}
+
+	queue, err := c.volcanoClient.SchedulingV1beta1().Queues().Get(ctx, queueName, metav1.GetOptions{})
 	if err != nil {
-		if kerrors.IsForbidden(err) {
-			c.logger.Warn("Insufficient RBAC permissions to list resourcequotas, skipping namespace quota check")
+		if kerrors.IsNotFound(err) {
+			c.logger.Warn("Volcano queue not found, skipping queue check", "queue", queueName)
 			return math.MaxInt, nil
 		}
-		return 0, fmt.Errorf("list resourcequotas in namespace %s: %w", c.ephemeralRunnerSetNS, err)
-	}
-	if len(quotaList.Items) == 0 {
-		c.logger.Info("No ResourceQuota found in namespace, skipping namespace quota check", "namespace", c.ephemeralRunnerSetNS)
-		return math.MaxInt, nil
+		if kerrors.IsForbidden(err) {
+			c.logger.Warn("Insufficient RBAC permissions to get Volcano queue, skipping queue check", "queue", queueName)
+			return math.MaxInt, nil
+		}
+		return 0, fmt.Errorf("get Volcano queue %q: %w", queueName, err)
 	}
 
 	capacity := math.MaxInt
 	for resName, req := range jobRequests {
-		// ResourceQuota tracks extended resources (e.g. huawei.com/ascend-1980) under
-		// the key "requests.<resource-name>".
-		quotaKey := corev1.ResourceName("requests." + string(resName))
-
-		for _, quota := range quotaList.Items {
-			hard, hasHard := quota.Status.Hard[quotaKey]
-			if !hasHard {
-				continue
-			}
-			used, hasUsed := quota.Status.Used[quotaKey]
-			if !hasUsed {
-				used = resource.MustParse("0")
-			}
-			remaining := hard.DeepCopy()
-			remaining.Sub(used)
-			c.logger.Info("Namespace quota check",
-				"quota", quota.Name,
-				"resource", quotaKey,
-				"hard", hard.String(),
-				"used", used.String(),
-				"remaining", remaining.String(),
-			)
-			feasibleAdditional := divideQuantity(remaining, req)
-			totalFeasible := currentRunnerCount + feasibleAdditional
-			if totalFeasible < capacity {
-				capacity = totalFeasible
-			}
+		cap, hasCap := queue.Spec.Capability[corev1.ResourceName(resName)]
+		if !hasCap {
+			continue
+		}
+		remaining := cap.DeepCopy()
+		if allocated, ok := queue.Status.Allocated[corev1.ResourceName(resName)]; ok {
+			remaining.Sub(allocated)
+		}
+		feasibleAdditional := divideQuantity(remaining, req)
+		totalFeasible := currentRunnerCount + feasibleAdditional
+		allocatedQty := queue.Status.Allocated[corev1.ResourceName(resName)]
+		c.logger.Info("Volcano queue check",
+			"queue", queueName,
+			"resource", resName,
+			"capability", cap.String(),
+			"allocated", allocatedQty.String(),
+			"remaining", remaining.String(),
+			"feasibleAdditional", feasibleAdditional,
+			"totalFeasible", totalFeasible,
+		)
+		if totalFeasible < capacity {
+			capacity = totalFeasible
 		}
 	}
 	return capacity, nil
