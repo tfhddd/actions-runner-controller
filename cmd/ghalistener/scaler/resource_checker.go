@@ -234,18 +234,29 @@ func (c *KubernetesResourceChecker) AdjustCount(ctx context.Context) (int, error
 	capacity := math.MaxInt
 	for resName, req := range jobRequests {
 		avail := available[resName]
-		feasibleAdditional := divideQuantity(avail, req)
-		// currentRunnerCount (from ERS status) is the authoritative count of runners
-		// of this specific type. Each runner consumes exactly req of this resource,
-		// and available already has their usage subtracted, so adding currentRunnerCount
-		// back gives the true total feasible count.
-		totalFeasible := currentRunnerCount + feasibleAdditional
+		totalAllocatable := clusterAllocatable[resName]
+		totalCapacity := divideQuantity(totalAllocatable, req)
+		var totalFeasible int
+		if totalCapacity == 0 {
+			// Cluster has no allocatable capacity for this resource at all
+			// (missing nodes, drained pool, or per-runner requirement exceeds any single node).
+			totalFeasible = 0
+		} else if currentRunnerCount >= totalCapacity {
+			// Runners already occupy all (or more than) the cluster's total capacity for
+			// this resource. Workflow pods for these runners may still be scheduling, so
+			// do not allow additional runners — report current count as the ceiling.
+			totalFeasible = currentRunnerCount
+		} else {
+			feasibleAdditional := divideQuantity(avail, req)
+			totalFeasible = currentRunnerCount + feasibleAdditional
+		}
 		c.logger.Info("Resource check",
 			"resource", resName,
 			"available", avail.String(),
+			"totalAllocatable", totalAllocatable.String(),
+			"totalCapacity", totalCapacity,
 			"perRunner", req.String(),
 			"currentRunners", currentRunnerCount,
-			"feasibleAdditional", feasibleAdditional,
 			"totalFeasible", totalFeasible,
 		)
 		if totalFeasible < capacity {
@@ -313,20 +324,33 @@ func (c *KubernetesResourceChecker) volcanoQueueCapacity(
 		if !hasCap {
 			continue
 		}
-		remaining := cap.DeepCopy()
-		if allocated, ok := queue.Status.Allocated[corev1.ResourceName(resName)]; ok {
-			remaining.Sub(allocated)
+		totalCapacity := divideQuantity(cap, req)
+		var totalFeasible int
+		if totalCapacity == 0 {
+			// Queue has no capacity for this resource at all
+			// (capability absent, zero, or smaller than per-runner requirement).
+			totalFeasible = 0
+		} else if currentRunnerCount >= totalCapacity {
+			// Runners already occupy all (or more than) the queue's total capability for
+			// this resource. Workflow pods may still be scheduling, so do not allow
+			// additional runners — report current count as the ceiling.
+			totalFeasible = currentRunnerCount
+		} else {
+			remaining := cap.DeepCopy()
+			if allocated, ok := queue.Status.Allocated[corev1.ResourceName(resName)]; ok {
+				remaining.Sub(allocated)
+			}
+			feasibleAdditional := divideQuantity(remaining, req)
+			totalFeasible = currentRunnerCount + feasibleAdditional
 		}
-		feasibleAdditional := divideQuantity(remaining, req)
-		totalFeasible := currentRunnerCount + feasibleAdditional
 		allocatedQty := queue.Status.Allocated[corev1.ResourceName(resName)]
 		c.logger.Info("Volcano queue check",
 			"queue", queueName,
 			"resource", resName,
 			"capability", cap.String(),
+			"totalCapacity", totalCapacity,
 			"allocated", allocatedQty.String(),
-			"remaining", remaining.String(),
-			"feasibleAdditional", feasibleAdditional,
+			"currentRunners", currentRunnerCount,
 			"totalFeasible", totalFeasible,
 		)
 		if totalFeasible < capacity {
