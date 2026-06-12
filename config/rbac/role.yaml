@@ -28,6 +28,13 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - nodes
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - ""
+  resources:
   - persistentvolumes
   verbs:
   - delete
@@ -169,3 +176,26 @@ rules:
   - list
   - update
   - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterroles
+  verbs:
+  - create
+  - delete
+  - get
+  - update
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterrolebindings
+  verbs:
+  - create
+  - delete
+  - get
+- apiGroups:
+  - scheduling.volcano.sh
+  resources:
+  - queues
+  verbs:
+  - get

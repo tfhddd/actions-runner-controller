@@ -25,6 +25,18 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
+func WithResourceChecker(rc ResourceChecker) Option {
+	return func(w *Scaler) {
+		w.resourceChecker = rc
+	}
+}
+
+func WithSetMaxRunners(fn func(int)) Option {
+	return func(w *Scaler) {
+		w.setMaxRunners = fn
+	}
+}
+
 type Config struct {
 	EphemeralRunnerSetNamespace string
 	EphemeralRunnerSetName      string
@@ -40,17 +52,21 @@ type Scaler struct {
 	targetRunners int
 	patchSeq      int
 	// dirty is set when there are any events handled before the desired count is called.
-	dirty  bool
-	logger *slog.Logger
+	dirty              bool
+	logger             *slog.Logger
+	resourceChecker    ResourceChecker
+	setMaxRunners      func(int)
+	originalMaxRunners int // preserves the configured upper bound
 }
 
 var _ listener.Scaler = (*Scaler)(nil)
 
 func New(config Config, options ...Option) (*Scaler, error) {
 	w := &Scaler{
-		config:        config,
-		targetRunners: -1,
-		patchSeq:      -1,
+		config:             config,
+		targetRunners:      -1,
+		patchSeq:           -1,
+		originalMaxRunners: config.MaxRunners,
 	}
 
 	conf, err := rest.InClusterConfig()
@@ -71,6 +87,16 @@ func New(config Config, options ...Option) (*Scaler, error) {
 
 	if err := w.applyDefaults(); err != nil {
 		return nil, err
+	}
+
+	if w.resourceChecker == nil {
+		w.resourceChecker = NewKubernetesResourceChecker(
+			clientset,
+			conf,
+			config.EphemeralRunnerSetNamespace,
+			config.EphemeralRunnerSetName,
+			w.logger.With("component", "resource-checker"),
+		)
 	}
 
 	return w, nil
@@ -167,6 +193,24 @@ func (w *Scaler) HandleJobCompleted(ctx context.Context, msg *scaleset.JobComple
 // Finally, it logs the scaled ephemeral runner set details and returns nil if successful.
 // If any error occurs during the process, it returns an error with a descriptive message.
 func (w *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
+	if w.resourceChecker != nil {
+		w.logger.Info("Handling desired runner count", "count", count)
+		capacity, err := w.resourceChecker.AdjustCount(ctx)
+		if err != nil {
+			w.logger.Warn("Resource check failed, proceeding without check", "error", err)
+		} else {
+			effectiveMax := min(capacity, w.originalMaxRunners)
+			w.config.MaxRunners = effectiveMax
+			if w.setMaxRunners != nil {
+				w.setMaxRunners(effectiveMax)
+			}
+			if effectiveMax == 0 {
+				w.logger.Info("No resources available, rejecting all runners")
+				return 0, nil
+			}
+		}
+	}
+
 	patchID := w.setDesiredWorkerState(count)
 
 	original, err := json.Marshal(
