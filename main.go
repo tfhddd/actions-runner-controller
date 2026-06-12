@@ -92,7 +92,6 @@ func main() {
 		autoScalingRunnerSetOnly bool
 		enableLeaderElection     bool
 		disableAdmissionWebhook  bool
-		updateStrategy           string
 		leaderElectionID         string
 		port                     int
 		syncPeriod               time.Duration
@@ -161,7 +160,6 @@ func main() {
 	flag.StringVar(&logLevel, "log-level", logging.LogLevelDebug, `The verbosity of the logging. Valid values are "debug", "info", "warn", "error". Defaults to "debug".`)
 	flag.StringVar(&logFormat, "log-format", "text", `The log format. Valid options are "text" and "json". Defaults to "text"`)
 	flag.BoolVar(&autoScalingRunnerSetOnly, "auto-scaling-runner-set-only", false, "Make controller only reconcile AutoRunnerScaleSet object.")
-	flag.StringVar(&updateStrategy, "update-strategy", "immediate", `Resources reconciliation strategy on upgrade with running/pending jobs. Valid values are: "immediate", "eventual". Defaults to "immediate".`)
 	flag.Var(&autoScalerImagePullSecrets, "auto-scaler-image-pull-secrets", "The default image-pull secret name for auto-scaler listener container.")
 	flag.IntVar(&k8sClientRateLimiterQPS, "k8s-client-rate-limiter-qps", 20, "The QPS value of the K8s client rate limiter.")
 	flag.IntVar(&k8sClientRateLimiterBurst, "k8s-client-rate-limiter-burst", 30, "The burst value of the K8s client rate limiter.")
@@ -211,14 +209,6 @@ func main() {
 
 			defaultNamespaces[watchSingleNamespace] = cache.Config{}
 			defaultNamespaces[managerNamespace] = cache.Config{}
-		}
-
-		switch updateStrategy {
-		case "eventual", "immediate":
-			log.Info(`Update strategy set to:`, "updateStrategy", updateStrategy)
-		default:
-			log.Info(`Update strategy not recognized. Defaulting to "immediately"`, "updateStrategy", updateStrategy)
-			updateStrategy = "immediate"
 		}
 	}
 
@@ -315,6 +305,7 @@ func main() {
 		rb := actionsgithubcom.ResourceBuilder{
 			ExcludeLabelPropagationPrefixes: excludeLabelPropagationPrefixes,
 			SecretResolver:                  secretResolver,
+			Scheme:                          mgr.GetScheme(),
 		}
 
 		log.Info("Resource builder initializing")
@@ -323,7 +314,8 @@ func main() {
 		switch workqueueRateLimiter {
 		case "typed_rate_limiter":
 			log.Info("Using typed rate limiter (per-item only, no global token bucket)")
-			controllerOpts = append(controllerOpts,
+			controllerOpts = append(
+				controllerOpts,
 				actionsgithubcom.WithTypedRateLimiter(workqueue.DefaultTypedItemBasedRateLimiter[reconcile.Request]()),
 			)
 		case "bucket_rate_limiter", "":
@@ -339,7 +331,6 @@ func main() {
 			Scheme:                             mgr.GetScheme(),
 			ControllerNamespace:                managerNamespace,
 			DefaultRunnerScaleSetListenerImage: managerImage,
-			UpdateStrategy:                     actionsgithubcom.UpdateStrategy(updateStrategy),
 			DefaultRunnerScaleSetListenerImagePullSecrets: autoScalerImagePullSecrets,
 			ResourceBuilder: rb,
 		}).SetupWithManager(mgr, controllerOpts...); err != nil {
